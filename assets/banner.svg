@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1d2128"/><stop offset="1" stop-color="#0e1013"/>
+    </linearGradient>
+    <linearGradient id="arc" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f3d27a"/><stop offset="1" stop-color="#c8902e"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="360" rx="28" fill="url(#bg)"/>
+  <g transform="translate(70 52)">
+    <circle cx="128" cy="128" r="104" fill="none" stroke="#fff" stroke-opacity="0.09" stroke-width="22"/>
+    <circle cx="128" cy="128" r="104" fill="none" stroke="url(#arc)" stroke-width="22" stroke-linecap="round" stroke-dasharray="470 654" transform="rotate(-90 128 128)"/>
+    <polygon points="128,66 74,176 128,176" fill="#f3d27a"/>
+    <polygon points="128,66 182,176 128,176" fill="#b07a22"/>
+    <rect x="62" y="176" width="132" height="10" rx="5" fill="#fff" fill-opacity="0.85"/>
+  </g>
+  <text x="400" y="170" font-family="JetBrainsMono Nerd Font, JetBrains Mono, monospace" font-size="110" font-weight="700" fill="#f3d27a">EIU</text>
+  <text x="404" y="228" font-family="JetBrainsMono Nerd Font, JetBrains Mono, monospace" font-size="36" fill="#e6e6e6">Egyptian Internet Usage</text>
+  <text x="404" y="276" font-family="JetBrainsMono Nerd Font, JetBrains Mono, monospace" font-size="24" fill="#8a9099">your home quota, day by day, on the Omarchy bar</text>
+</svg>

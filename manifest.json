@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "eiu",
+  "name": "EIU - Egyptian Internet Usage",
+  "version": "1.0.0",
+  "author": "Malek Abokhatwa",
+  "license": "MIT",
+  "homepage": "https://github.com/Malekabokhatwa/EIU",
+  "description": "How much of your Egyptian home internet quota this computer has used, day by day, and when it renews. Auto-detects e&, WE, Orange, Vodafone and Noor.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Internet Usage (EIU)",
+    "description": "Quota ring, data used this cycle, renewal date and a per-day chart",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "display": "used", "showRing": true, "refreshSeconds": 60 },
+    "schema": [
+      { "key": "display", "type": "enum", "label": "Bar text", "options": ["used", "remaining", "percent", "icon"], "defaultValue": "used", "description": "What the bar shows next to the ring. Right-click the widget to cycle." },
+      { "key": "showRing", "type": "boolean", "label": "Quota ring", "defaultValue": true, "description": "Draw the usage ring around the icon." },
+      { "key": "refreshSeconds", "type": "integer", "label": "Refresh (seconds)", "min": 15, "max": 600, "step": 15, "defaultValue": 60, "description": "How often counters are sampled." }
+    ]
+  }
+}

@@ -1,0 +1,999 @@
+#!/usr/bin/env python3
+"""EIU - Egyptian Internet Usage.
+
+Tracks how much data this computer uses per day, against your home internet
+plan, and tells you when the quota renews. Built for Omarchy's bar but works
+as a plain CLI too.
+
+  eiu                     status for the current cycle
+  eiu status [--json]     same, or machine readable
+  eiu collect [--status]  sample interface counters (the bar runs this every minute)
+  eiu setup               interactive setup (provider, plan, renewal)
+  eiu set <key> <value>   change one setting (see `eiu set --help`)
+  eiu detect [--json]     show how the provider was detected
+  eiu adjust <amount>     correct this cycle to match your ISP's figure (e.g. 120GB)
+  eiu adjust --clear      remove the correction
+  eiu history [--json]    totals of previous cycles
+  eiu debug on|off        let EIU run outside Egypt (for testing)
+  eiu providers [--json]  list known providers and their plans
+  eiu doctor              check that everything is in place
+  eiu reset --yes         forget all collected data
+"""
+
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+
+VERSION = "1.0.0"
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.environ.get("EIU_CONFIG_DIR", os.path.join(os.environ.get("XDG_CONFIG_HOME", HOME + "/.config"), "eiu"))
+DATA_DIR = os.environ.get("EIU_DATA_DIR", os.path.join(os.environ.get("XDG_DATA_HOME", HOME + "/.local/share"), "eiu"))
+STATE_DIR = os.environ.get("EIU_STATE_DIR", os.path.join(os.environ.get("XDG_STATE_HOME", HOME + "/.local/state"), "eiu"))
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+LEDGER_FILE = os.path.join(DATA_DIR, "ledger.json")
+STATUS_FILE = os.path.join(STATE_DIR, "status.json")
+GEO_FILE = os.path.join(STATE_DIR, "geo.json")
+LOCK_FILE = os.path.join(STATE_DIR, "lock")
+
+GEO_TTL = 6 * 3600          # re-check location every 6 hours
+GEO_FAIL_TTL = 15 * 60      # retry sooner after a failed lookup
+LEDGER_KEEP_DAYS = 400      # keep a bit over a year of daily history
+
+# Interfaces that never carry ISP traffic of their own (virtual, tunnels,
+# containers). Tunnel traffic also crosses the physical link, so counting it
+# would double it.
+SKIP_IFACE = re.compile(r"^(lo|docker|br-|veth|virbr|vnet|tailscale|tun|tap|wg|zt|cni|flannel|podman|lxc|kube|dummy|ifb|sit|ip6tnl|gre|nlmon|wwan-dummy)")
+
+PLANS_GB = [200, 300, 400, 500, 600, 700, 800, 900, 1000]
+
+# Known Egyptian home ISPs. ASNs come from the RIR registry; SSID patterns are
+# the default names the ISPs' routers ship with. Renewal is per account in
+# Egypt (WE renews 30 days after the last renewal, the others on a monthly
+# date shown in their apps), so `renewal` is only the default offered in setup.
+PROVIDERS = {
+    "etisalat": {
+        "name": "e& (Etisalat Misr)",
+        "short": "e&",
+        "asns": [36992],
+        "keywords": ["etisalat", "e&", "eand", "etisalat misr"],
+        "ssid": r"^(etisalat|e&|eand|e_and)",
+        "renewal": {"mode": "monthly", "day": 15},
+        "renewal_note": "e& home internet renews on the 15th of every month.",
+        "app": "My e& app or *500# from the landline account",
+    },
+    "we": {
+        "name": "WE (Telecom Egypt / TE Data)",
+        "short": "WE",
+        "asns": [8452, 25576],
+        "keywords": ["te data", "tedata", "telecom egypt", "te-data"],
+        "ssid": r"^(we[_\-\s]|we$|te[_\-\s]?data|tedata|vdsl_we|my we)",
+        "renewal": {"mode": "every30", "day": 1},
+        "renewal_note": "WE renews 30 days after your last renewal; renewing early resets the cycle to today.",
+        "app": "My WE app or my.te.eg",
+    },
+    "orange": {
+        "name": "Orange Egypt (DSL)",
+        "short": "Orange",
+        "asns": [24863, 37069],
+        "keywords": ["orange", "link dot net", "linkdotnet", "link egypt", "mobinil"],
+        "ssid": r"^(orange|link[_\-]|linkdsl)",
+        "renewal": {"mode": "monthly", "day": 1},
+        "renewal_note": "Orange shows your renewal date at dsl.orange.eg and in the My Orange app.",
+        "app": "My Orange app or dsl.orange.eg",
+    },
+    "vodafone": {
+        "name": "Vodafone Egypt (Home)",
+        "short": "Vodafone",
+        "asns": [24835, 36935],
+        "keywords": ["vodafone", "raya"],
+        "ssid": r"^(vodafone|vf[_\-])",
+        "renewal": {"mode": "monthly", "day": 1},
+        "renewal_note": "Vodafone shows your renewal date in the Ana Vodafone app.",
+        "app": "Ana Vodafone app",
+    },
+    "noor": {
+        "name": "Noor",
+        "short": "Noor",
+        "asns": [20928],
+        "keywords": ["noor"],
+        "ssid": r"^noor",
+        "renewal": {"mode": "monthly", "day": 1},
+        "renewal_note": "Check your renewal date with Noor customer service.",
+        "app": "Noor customer service",
+    },
+    "other": {
+        "name": "Other / unknown",
+        "short": "ISP",
+        "asns": [],
+        "keywords": [],
+        "ssid": r"^$a",
+        "renewal": {"mode": "monthly", "day": 1},
+        "renewal_note": "Set the day your quota renews.",
+        "app": "your provider's app",
+    },
+}
+
+DEFAULT_CONFIG = {
+    "version": 1,
+    "setup_done": False,
+    "provider": "",            # empty = follow auto-detection
+    "plan_gb": 0,              # 0 = not chosen yet
+    "renewal_mode": "",        # monthly | every30 ; empty = provider default
+    "renewal_day": 0,          # 1..31 ; 0 = provider default
+    "renewal_anchor": "",      # YYYY-MM-DD, for every30
+    "count": "home",           # home = only traffic on home networks ; all = everything
+    "home_networks": [],       # SSIDs / wired gateway ids that use the plan
+    "unit_base": 1000,         # 1000 (GB) or 1024 (GiB)
+    "alerts": [75, 90, 100],
+    "notify": True,
+    "debug": False,
+    "adjust": None,            # {"cycle_start": "YYYY-MM-DD", "bytes": int}
+}
+
+
+# ------------------------------------------------------------------ helpers
+
+def now():
+    return dt.datetime.now()
+
+
+def today():
+    return dt.date.today()
+
+
+def ensure_dirs():
+    for d in (CONFIG_DIR, DATA_DIR, STATE_DIR):
+        os.makedirs(d, exist_ok=True)
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(read_json(CONFIG_FILE, {}))
+    return cfg
+
+
+def save_config(cfg):
+    write_json(CONFIG_FILE, cfg)
+
+
+def run(cmd, timeout=3):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def fmt_bytes(n, base=1000, digits=None):
+    n = float(max(0, n))
+    units = ["B", "KB", "MB", "GB", "TB"] if base == 1000 else ["B", "KiB", "MiB", "GiB", "TiB"]
+    i = 0
+    while n >= base and i < len(units) - 1:
+        n /= base
+        i += 1
+    if digits is None:
+        digits = 0 if i <= 1 or n >= 100 else (1 if n >= 10 else 2)
+    return f"{n:.{digits}f} {units[i]}"
+
+
+def parse_amount(text, base=1000):
+    m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?i?b?)?\s*", text.lower())
+    if not m:
+        raise ValueError(f"cannot read amount '{text}' (try 120GB or 1.2TB)")
+    val = float(m.group(1))
+    unit = (m.group(2) or "gb").rstrip("b").rstrip("i")
+    power = {"": 3, "k": 1, "m": 2, "g": 3, "t": 4}[unit]
+    return int(val * base ** power)
+
+
+def plan_label(gb):
+    if not gb:
+        return "No plan"
+    return f"{gb // 1000} TB" if gb % 1000 == 0 and gb >= 1000 else f"{gb} GB"
+
+
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+# ------------------------------------------------------------- networking
+
+def interfaces():
+    """{iface: (rx_bytes, tx_bytes)} for interfaces that can carry ISP traffic."""
+    out = {}
+    try:
+        with open("/proc/net/dev") as f:
+            lines = f.readlines()[2:]
+    except OSError:
+        return out
+    for line in lines:
+        name, _, rest = line.partition(":")
+        name = name.strip()
+        if SKIP_IFACE.match(name):
+            continue
+        fields = rest.split()
+        if len(fields) >= 9:
+            out[name] = (int(fields[0]), int(fields[8]))
+    return out
+
+
+def default_route():
+    """(iface, gateway_ip) of the default route, or (None, None)."""
+    for line in run(["ip", "-4", "route", "show", "default"]).splitlines():
+        m = re.search(r"via (\S+) dev (\S+)", line)
+        if m:
+            return m.group(2), m.group(1)
+    return None, None
+
+
+def ssid_of(iface):
+    m = re.search(r"SSID: (.+)", run(["iw", "dev", iface, "link"]))
+    if m:
+        return m.group(1).strip()
+    for line in run(["nmcli", "-t", "-f", "GENERAL.CONNECTION", "dev", "show", iface]).splitlines():
+        if ":" in line and line.split(":", 1)[1]:
+            return line.split(":", 1)[1]
+    return None
+
+
+def is_wireless(iface):
+    return os.path.isdir(f"/sys/class/net/{iface}/wireless")
+
+
+def gateway_mac(gw):
+    if not gw:
+        return None
+    m = re.search(r"lladdr (\S+)", run(["ip", "neigh", "show", gw]))
+    return m.group(1).lower() if m else None
+
+
+def network_id(iface, gw_by_iface):
+    """A stable name for the network an interface is on."""
+    if is_wireless(iface):
+        s = ssid_of(iface)
+        if s:
+            return s
+    gw = gw_by_iface.get(iface)
+    mac = gateway_mac(gw)
+    if mac:
+        return f"wired:{mac}"
+    return f"{iface}"
+
+
+def gateways():
+    gws = {}
+    for line in run(["ip", "-4", "route", "show", "default"]).splitlines():
+        m = re.search(r"via (\S+) dev (\S+)", line)
+        if m and m.group(2) not in gws:
+            gws[m.group(2)] = m.group(1)
+    return gws
+
+
+# ----------------------------------------------------------------- geo/IP
+
+def fetch_json(url, timeout=4):
+    req = urllib.request.Request(url, headers={"User-Agent": f"eiu/{VERSION}", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def lookup_ip():
+    """Public IP facts from the first service that answers."""
+    try:
+        d = fetch_json("https://ipinfo.io/json")
+        asn, _, org = (d.get("org") or "").partition(" ")
+        return {"ip": d.get("ip"), "country": d.get("country"), "city": d.get("city"),
+                "asn": int(asn[2:]) if asn.startswith("AS") and asn[2:].isdigit() else None,
+                "org": org, "hostname": d.get("hostname", ""), "source": "ipinfo.io"}
+    except Exception:
+        pass
+    try:
+        d = fetch_json("https://ifconfig.co/json")
+        asn = d.get("asn") or ""
+        return {"ip": d.get("ip"), "country": d.get("country_iso"), "city": d.get("city"),
+                "asn": int(asn[2:]) if str(asn).startswith("AS") and asn[2:].isdigit() else None,
+                "org": d.get("asn_org", ""), "hostname": d.get("hostname", ""), "source": "ifconfig.co"}
+    except Exception:
+        return None
+
+
+def geo(force=False):
+    cache = read_json(GEO_FILE, {})
+    age = now().timestamp() - cache.get("checked", 0)
+    ttl = GEO_TTL if cache.get("ok") else GEO_FAIL_TTL
+    if not force and cache and age < ttl:
+        return cache
+    info = lookup_ip()
+    if info:
+        cache = dict(info, ok=True, checked=now().timestamp(), last_ok=info)
+    else:
+        prev = cache.get("last_ok")
+        cache = {"ok": False, "checked": now().timestamp(), "last_ok": prev}
+    write_json(GEO_FILE, cache)
+    return cache
+
+
+def timezone_name():
+    tz = run(["timedatectl", "show", "-p", "Timezone", "--value"]).strip()
+    if not tz:
+        try:
+            tz = os.path.realpath("/etc/localtime").split("zoneinfo/")[-1]
+        except OSError:
+            tz = ""
+    return tz
+
+
+def egypt_gate(cfg, g, current_networks):
+    """Decide whether EIU should run. Returns (allowed, reason)."""
+    if cfg.get("debug") or os.environ.get("EIU_DEBUG") == "1":
+        return True, "debug"
+    if g.get("ok") and g.get("country") == "EG":
+        return True, "ip"
+    homes = set(cfg.get("home_networks") or [])
+    if homes & set(current_networks):
+        return True, "home-network"  # a VPN may hide the country; the home network can't move
+    if not g.get("ok"):
+        last = g.get("last_ok") or {}
+        if last.get("country") == "EG" or timezone_name() == "Africa/Cairo":
+            return True, "offline-fallback"
+    return False, "outside-egypt"
+
+
+# --------------------------------------------------------- provider detect
+
+def router_name(gw, mac, refresh=False):
+    """The router's web page title (e.g. 'D-Link', 'HG8145V5'), cached per gateway MAC."""
+    if not gw:
+        return ""
+    path = os.path.join(STATE_DIR, "routers.json")
+    cache = read_json(path, {})
+    key = mac or gw
+    if key in cache and not refresh:
+        return cache[key]
+    html = run(["curl", "-s", "--max-time", "2", f"http://{gw}/"], timeout=3)
+    m = re.search(r"<title>(.*?)</title>", html, re.I | re.S)
+    title = m.group(1).strip() if m else ""
+    title = re.sub(r"&#(\d+);", lambda x: chr(int(x.group(1))), title)[:60]
+    cache[key] = title
+    write_json(path, cache)
+    return title
+
+
+def detect_provider(g=None, quick=False):
+    """Score every provider against what the machine can see."""
+    g = g if g is not None else geo()
+    iface, gw = default_route()
+    ssid = ssid_of(iface) if iface and is_wireless(iface) else None
+    mac = gateway_mac(gw)
+    router = router_name(gw, mac, refresh=not quick)
+    ipinfo = g.get("last_ok") if not g.get("ok") else g
+    ipinfo = ipinfo or {}
+    asn, org, host = ipinfo.get("asn"), (ipinfo.get("org") or "").lower(), (ipinfo.get("hostname") or "").lower()
+
+    scores, evidence = {}, {}
+    for pid, p in PROVIDERS.items():
+        if pid == "other":
+            continue
+        s, ev = 0, []
+        if asn and asn in p["asns"]:
+            s += 60; ev.append(f"public IP is on AS{asn} ({ipinfo.get('org')})")
+        elif any(k in org for k in p["keywords"]):
+            s += 40; ev.append(f"IP owner '{ipinfo.get('org')}'")
+        if host and any(k.replace(" ", "") in host for k in p["keywords"]):
+            s += 15; ev.append(f"reverse DNS {host}")
+        if ssid and re.search(p["ssid"], ssid, re.I):
+            s += 40; ev.append(f"Wi-Fi name '{ssid}'")
+        if router and any(k in router.lower() for k in p["keywords"]):
+            s += 10; ev.append(f"router page '{router}'")
+        if s:
+            scores[pid], evidence[pid] = s, ev
+    best = max(scores, key=scores.get) if scores else "other"
+    conf = min(100, scores.get(best, 0))
+    return {
+        "provider": best,
+        "name": PROVIDERS[best]["name"],
+        "confidence": conf,
+        "evidence": evidence.get(best, []),
+        "scores": scores,
+        "signals": {"ssid": ssid, "interface": iface, "gateway": gw, "gateway_mac": mac,
+                    "router": router, "asn": asn, "org": ipinfo.get("org"), "public_ip": ipinfo.get("ip"),
+                    "country": ipinfo.get("country"), "city": ipinfo.get("city")},
+    }
+
+
+# --------------------------------------------------------------- the cycle
+
+def effective_provider(cfg, detected=None):
+    if cfg.get("provider") in PROVIDERS:
+        return cfg["provider"]
+    if detected:
+        return detected["provider"]
+    cached = read_json(STATUS_FILE, {}).get("detected", {})
+    return cached.get("provider") or "other"
+
+
+def renewal_settings(cfg, provider):
+    d = PROVIDERS[provider]["renewal"]
+    mode = cfg.get("renewal_mode") or d["mode"]
+    day = int(cfg.get("renewal_day") or d["day"])
+    return mode, max(1, min(31, day)), cfg.get("renewal_anchor") or ""
+
+
+def clamp_day(year, month, day):
+    nxt = dt.date(year + (month == 12), month % 12 + 1, 1)
+    last = (nxt - dt.timedelta(days=1)).day
+    return dt.date(year, month, min(day, last))
+
+
+def cycle_for(day_, mode, rday, anchor):
+    """(start, next_renewal) of the cycle containing day_. start is inclusive."""
+    if mode == "every30":
+        try:
+            a = dt.date.fromisoformat(anchor)
+        except ValueError:
+            a = clamp_day(day_.year, day_.month, rday)
+        k = (day_ - a).days // 30
+        start = a + dt.timedelta(days=30 * k)
+        return start, start + dt.timedelta(days=30)
+    this = clamp_day(day_.year, day_.month, rday)
+    if day_ >= this:
+        start = this
+        ny, nm = (day_.year + 1, 1) if day_.month == 12 else (day_.year, day_.month + 1)
+        return start, clamp_day(ny, nm, rday)
+    py, pm = (day_.year - 1, 12) if day_.month == 1 else (day_.year, day_.month - 1)
+    return clamp_day(py, pm, rday), this
+
+
+# ----------------------------------------------------------------- collect
+
+class Locked:
+    def __enter__(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.f = open(LOCK_FILE, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def carrier(iface):
+    try:
+        with open(f"/sys/class/net/{iface}/carrier") as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def collect(cfg, record=True):
+    """Add the bytes moved since the last sample to today's ledger.
+
+    With record=False (outside Egypt) the counters still advance, so the
+    traffic is skipped rather than counted later."""
+    ensure_dirs()
+    with Locked():
+        ledger = read_json(LEDGER_FILE, {"days": {}, "last": {}})
+        days, last = ledger.setdefault("days", {}), ledger.setdefault("last", {})
+        bid = boot_id()
+        gws = gateways()
+        key = today().isoformat()
+        nets_now = []
+        for iface, (rx, tx) in interfaces().items():
+            prev = last.get(iface)
+            if prev and prev.get("boot") == bid and rx >= prev["rx"] and tx >= prev["tx"]:
+                drx, dtx = rx - prev["rx"], tx - prev["tx"]
+            elif prev and prev.get("boot") == bid:
+                drx, dtx = rx, tx       # interface was re-created; counters restarted
+            elif prev:
+                drx, dtx = rx, tx       # rebooted: everything since boot is new
+            else:
+                drx, dtx = 0, 0         # first sight: start counting from now
+            last[iface] = {"rx": rx, "tx": tx, "boot": bid}
+            up = carrier(iface)
+            if not up and not (drx or dtx):
+                continue
+            net = network_id(iface, gws) if up else (prev or {}).get("net", iface)
+            last[iface]["net"] = net
+            if up and iface in gws:
+                nets_now.append(net)
+            if record and (drx or dtx):
+                d = days.setdefault(key, {}).setdefault(net, [0, 0])
+                d[0] += drx
+                d[1] += dtx
+        cutoff = (today() - dt.timedelta(days=LEDGER_KEEP_DAYS)).isoformat()
+        for k in [k for k in days if k < cutoff]:
+            del days[k]
+        ledger.setdefault("since", key)
+        ledger["updated"] = now().isoformat(timespec="seconds")
+        ledger["networks_now"] = nets_now
+        write_json(LEDGER_FILE, ledger)
+    return ledger
+
+
+# ------------------------------------------------------------------ status
+
+def counted(cfg, net):
+    if cfg.get("count") == "all":
+        return True
+    homes = cfg.get("home_networks") or []
+    return not homes or net in homes
+
+
+def build_status(cfg, ledger=None, quick=True, force_geo=False):
+    ledger = ledger or read_json(LEDGER_FILE, {"days": {}})
+    g = geo(force=force_geo)
+    nets_now = ledger.get("networks_now") or []
+    allowed, reason = egypt_gate(cfg, g, nets_now)
+    detected = detect_provider(g, quick=quick)
+    prov = effective_provider(cfg, detected)
+    mode, rday, anchor = renewal_settings(cfg, prov)
+    base = int(cfg.get("unit_base") or 1000)
+    t = today()
+    start, renew = cycle_for(t, mode, rday, anchor)
+    days = ledger.get("days", {})
+    try:
+        since = dt.date.fromisoformat(ledger.get("since") or t.isoformat())
+    except ValueError:
+        since = t
+
+    daily, used, by_net = [], 0, {}
+    d = start
+    while d < renew:
+        k = d.isoformat()
+        rx = tx = 0
+        for net, (r, x) in days.get(k, {}).items():
+            if counted(cfg, net):
+                rx += r; tx += x
+                by_net[net] = by_net.get(net, 0) + r + x
+            else:
+                by_net.setdefault(f"~{net}", 0)
+                by_net[f"~{net}"] += r + x
+        if d <= t:
+            used += rx + tx
+        daily.append({"date": k, "day": d.day, "weekday": d.strftime("%a"), "rx": rx, "tx": tx,
+                      "total": rx + tx, "future": d > t, "today": d == t, "tracked": d >= since})
+        d += dt.timedelta(days=1)
+
+    adj = cfg.get("adjust")
+    adjust = 0
+    if adj and adj.get("cycle_start") == start.isoformat():
+        adjust = int(adj.get("bytes", 0))
+    used_total = max(0, used + adjust)
+
+    plan_gb = int(cfg.get("plan_gb") or 0)
+    quota = plan_gb * base ** 3
+    elapsed = (t - start).days + 1
+    length = (renew - start).days
+    days_left = (renew - t).days
+    tracked_days = (t - max(start, since)).days + 1
+    avg = used / tracked_days if tracked_days > 0 else 0
+    if adjust:
+        avg = used_total / elapsed if elapsed else 0
+    projected = used_total + avg * (length - elapsed)
+    remaining = max(0, quota - used_total) if quota else 0
+    pct = (used_total / quota * 100) if quota else 0
+    level = "ok"
+    if quota:
+        if pct >= 100: level = "over"
+        elif pct >= 90: level = "critical"
+        elif pct >= 75 or projected > quota: level = "warning"
+
+    st = {
+        "version": VERSION,
+        "generated": now().isoformat(timespec="seconds"),
+        "enabled": allowed,
+        "gate": reason,
+        "debug": bool(cfg.get("debug") or os.environ.get("EIU_DEBUG") == "1"),
+        "setup_done": bool(cfg.get("setup_done")),
+        "location": {"country": (g.get("country") if g.get("ok") else (g.get("last_ok") or {}).get("country")),
+                     "city": g.get("city") if g.get("ok") else None, "online": bool(g.get("ok")),
+                     "timezone": timezone_name()},
+        "provider": prov,
+        "provider_name": PROVIDERS[prov]["name"],
+        "provider_short": PROVIDERS[prov]["short"],
+        "provider_source": "manual" if cfg.get("provider") in PROVIDERS else "auto",
+        "detected": detected,
+        "plan_gb": plan_gb,
+        "plan_label": plan_label(plan_gb),
+        "unit_base": base,
+        "renewal": {"mode": mode, "day": rday, "anchor": anchor,
+                    "note": PROVIDERS[prov]["renewal_note"], "app": PROVIDERS[prov]["app"]},
+        "cycle": {"start": start.isoformat(), "renews": renew.isoformat(),
+                  "renews_label": renew.strftime("%a %-d %b"), "days_left": days_left,
+                  "length": length, "elapsed": elapsed},
+        "tracking_since": since.isoformat(),
+        "partial": since > start and not adjust,
+        "used": used_total,
+        "measured": used,
+        "adjust": adjust,
+        "used_label": fmt_bytes(used_total, base),
+        "quota": quota,
+        "remaining": remaining,
+        "remaining_label": fmt_bytes(remaining, base) if quota else "",
+        "percent": round(pct, 1),
+        "level": level,
+        "today": next((x["total"] for x in daily if x["today"]), 0),
+        "today_label": fmt_bytes(next((x["total"] for x in daily if x["today"]), 0), base),
+        "average_label": fmt_bytes(avg, base),
+        "projected": int(projected),
+        "projected_label": fmt_bytes(projected, base),
+        "daily_budget_label": fmt_bytes(remaining / max(1, days_left), base) if quota else "",
+        "daily": daily,
+        "networks": [{"name": k.lstrip("~"), "bytes": v, "label": fmt_bytes(v, base), "counted": not k.startswith("~")}
+                     for k, v in sorted(by_net.items(), key=lambda kv: -kv[1])],
+        "networks_now": nets_now,
+        "home_networks": cfg.get("home_networks") or [],
+        "count": cfg.get("count", "home"),
+        "notify": bool(cfg.get("notify", True)),
+        "plans": PLANS_GB,
+        "providers": [{"value": k, "label": v["name"]} for k, v in PROVIDERS.items()],
+        "updated": ledger.get("updated"),
+    }
+    return st
+
+
+def maybe_alert(cfg, st):
+    if not cfg.get("notify", True) or not st["quota"] or not st["enabled"]:
+        return
+    state = read_json(os.path.join(STATE_DIR, "alerts.json"), {})
+    if state.get("cycle") != st["cycle"]["start"]:
+        state = {"cycle": st["cycle"]["start"], "sent": []}
+    for th in sorted(cfg.get("alerts") or []):
+        if st["percent"] >= th and th not in state["sent"]:
+            state["sent"].append(th)
+            title = "Quota used up" if th >= 100 else f"{th}% of your internet quota used"
+            body = (f"{st['used_label']} of {st['plan_label']} on {st['provider_short']}. "
+                    f"Renews {st['cycle']['renews_label']} (in {st['cycle']['days_left']}d).")
+            notify(title, body, critical=th >= 90)
+    write_json(os.path.join(STATE_DIR, "alerts.json"), state)
+
+
+def notify(title, body, critical=False):
+    send = shutil.which("omarchy-notification-send")
+    if send:
+        subprocess.Popen([send, "-g", "󰛳", "-u", "critical" if critical else "normal", title, body])
+    elif shutil.which("notify-send"):
+        subprocess.Popen(["notify-send", "-a", "EIU", title, body])
+
+
+def refresh_status(cfg, collect_first=False, quick=True, force_geo=False):
+    ledger = None
+    if collect_first:
+        prev_nets = read_json(LEDGER_FILE, {}).get("networks_now") or []
+        allowed, _ = egypt_gate(cfg, geo(force=force_geo), prev_nets)
+        ledger = collect(cfg, record=allowed)
+    st = build_status(cfg, ledger, quick=quick)
+    write_json(STATUS_FILE, st)
+    maybe_alert(cfg, st)
+    return st
+
+
+# ---------------------------------------------------------------- printing
+
+def bar(frac, width=24):
+    frac = max(0.0, min(1.0, frac))
+    full = int(frac * width)
+    return "█" * full + "░" * (width - full)
+
+
+def print_status(st):
+    if not st["enabled"]:
+        print("EIU only runs in Egypt. Detected country:", st["location"]["country"] or "unknown")
+        print("Run `eiu debug on` to use it anyway.")
+        return
+    tag = "  [debug]" if st["debug"] else ""
+    print(f"EIU · {st['provider_name']} · {st['plan_label']}{tag}")
+    c = st["cycle"]
+    print(f"Cycle {c['start']} → renews {c['renews_label']} ({c['days_left']} day{'s' if c['days_left'] != 1 else ''} left)")
+    if st["quota"]:
+        print(f"Used  {st['used_label']} of {st['plan_label']}  ({st['percent']}%)  {bar(st['percent'] / 100)}")
+        print(f"Left  {st['remaining_label']}  ·  about {st['daily_budget_label']}/day to make it")
+        print(f"Pace  {st['average_label']}/day  →  {st['projected_label']} by renewal")
+    else:
+        print(f"Used  {st['used_label']} this cycle (no plan set: run `eiu setup`)")
+    if st["adjust"]:
+        print(f"      includes a manual correction of {fmt_bytes(st['adjust'], st['unit_base'])}")
+    print()
+    if st["partial"]:
+        print(f"Tracking started {st['tracking_since']}; earlier days this cycle are unknown.")
+        print("Run `eiu adjust <amount>` with the figure from your provider's app to correct the total.")
+        print()
+    peak = max([x["total"] for x in st["daily"]] + [1])
+    for x in st["daily"]:
+        if x["future"] or not x["tracked"]:
+            continue
+        mark = "›" if x["today"] else " "
+        print(f"{mark}{x['weekday']} {x['date'][5:]}  {bar(x['total'] / peak, 30)}  {fmt_bytes(x['total'], st['unit_base'])}")
+
+
+# --------------------------------------------------------------------- setup
+
+def gum(*args, inp=None):
+    r = subprocess.run(["gum", *args], input=inp, capture_output=False, stdout=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        sys.exit(130)
+    return r.stdout.strip()
+
+
+def setup(cfg):
+    if not shutil.which("gum"):
+        sys.exit("eiu setup needs gum (pacman -S gum); or use `eiu set`.")
+    print("Looking at your connection…")
+    det = detect_provider(geo(force=True))
+    names = [PROVIDERS[k]["name"] for k in PROVIDERS]
+    pre = PROVIDERS[det["provider"]]["name"]
+    if det["evidence"]:
+        print(f"Detected {pre} ({det['confidence']}%): " + "; ".join(det["evidence"]))
+    pick = gum("choose", "--header", "Your home internet provider", "--selected", pre, *names)
+    prov = next(k for k, v in PROVIDERS.items() if v["name"] == pick)
+
+    labels = [plan_label(g) for g in PLANS_GB] + ["Custom…"]
+    cur = plan_label(cfg.get("plan_gb")) if cfg.get("plan_gb") else "300 GB"
+    choice = gum("choose", "--header", "Your monthly data plan", "--selected", cur, *labels)
+    if choice == "Custom…":
+        gb = int(parse_amount(gum("input", "--placeholder", "e.g. 140GB or 1.5TB"), 1000) / 1000 ** 3)
+    else:
+        gb = PLANS_GB[labels.index(choice)]
+
+    p = PROVIDERS[prov]
+    print(p["renewal_note"])
+    mode = p["renewal"]["mode"]
+    if mode == "every30":
+        anchor = gum("input", "--header", "Date of your last renewal (YYYY-MM-DD)", "--value", today().isoformat())
+        dt.date.fromisoformat(anchor)
+        cfg.update(renewal_mode="every30", renewal_anchor=anchor, renewal_day=dt.date.fromisoformat(anchor).day)
+    else:
+        day = gum("input", "--header", "Day of the month your quota renews", "--value", str(cfg.get("renewal_day") or p["renewal"]["day"]))
+        cfg.update(renewal_mode="monthly", renewal_day=max(1, min(31, int(day))))
+
+    net = det["signals"]["ssid"] or (f"wired:{det['signals']['gateway_mac']}" if det["signals"]["gateway_mac"] else None)
+    homes = set(cfg.get("home_networks") or [])
+    if net:
+        r = subprocess.run(["gum", "confirm", f"Count only traffic on '{net}' (your home network)?"])
+        if r.returncode == 0:
+            homes.add(net); cfg["count"] = "home"
+        else:
+            cfg["count"] = "all"
+    cfg.update(provider=prov, plan_gb=gb, home_networks=sorted(homes), setup_done=True)
+    save_config(cfg)
+    st = refresh_status(cfg, collect_first=True)
+    print()
+    print_status(st)
+
+
+SETTABLE = {
+    "provider": "one of " + ", ".join(PROVIDERS) + " (or 'auto')",
+    "plan": "plan size: 200..1000 (GB), or an amount like 140GB / 1.5TB",
+    "renewal-day": "1..31, the day of month the quota renews",
+    "renewal-mode": "monthly | every30",
+    "renewal-anchor": "YYYY-MM-DD of a renewal, for every30",
+    "count": "home | all",
+    "home-add": "network name (SSID) to count",
+    "home-remove": "network name to stop counting",
+    "home-current": "add the network you are on now",
+    "unit": "1000 | 1024",
+    "notify": "on | off",
+    "debug": "on | off",
+}
+
+
+def set_key(cfg, key, value):
+    if key == "provider":
+        cfg["provider"] = "" if value == "auto" else value
+        if value != "auto" and value not in PROVIDERS:
+            raise ValueError(f"unknown provider {value}")
+        if value in PROVIDERS and not cfg.get("renewal_mode"):
+            cfg["renewal_mode"] = PROVIDERS[value]["renewal"]["mode"]
+            cfg["renewal_day"] = PROVIDERS[value]["renewal"]["day"]
+    elif key == "plan":
+        gb = int(value) if value.isdigit() else int(parse_amount(value, 1000) / 1000 ** 3)
+        cfg["plan_gb"] = gb
+    elif key == "renewal-day":
+        cfg["renewal_day"] = max(1, min(31, int(value)))
+    elif key == "renewal-mode":
+        if value not in ("monthly", "every30"):
+            raise ValueError("renewal-mode is monthly or every30")
+        cfg["renewal_mode"] = value
+        if value == "every30" and not cfg.get("renewal_anchor"):
+            cfg["renewal_anchor"] = today().isoformat()
+    elif key == "renewal-anchor":
+        dt.date.fromisoformat(value)
+        cfg["renewal_anchor"] = value
+    elif key == "count":
+        if value not in ("home", "all"):
+            raise ValueError("count is home or all")
+        cfg["count"] = value
+    elif key in ("home-add", "home-remove", "home-current"):
+        homes = set(cfg.get("home_networks") or [])
+        if key == "home-current":
+            nets = read_json(LEDGER_FILE, {}).get("networks_now") or collect(cfg).get("networks_now") or []
+            homes.update(nets)
+        elif key == "home-add":
+            homes.add(value)
+        else:
+            homes.discard(value)
+        cfg["home_networks"] = sorted(homes)
+    elif key == "unit":
+        cfg["unit_base"] = 1024 if value == "1024" else 1000
+    elif key in ("notify", "debug"):
+        cfg[key] = value in ("on", "true", "1", "yes")
+    elif key == "setup-done":
+        cfg["setup_done"] = value in ("on", "true", "1", "yes")
+    else:
+        raise ValueError(f"unknown setting {key}")
+    save_config(cfg)
+
+
+# --------------------------------------------------------------------- misc
+
+def history(cfg):
+    ledger = read_json(LEDGER_FILE, {"days": {}})
+    prov = effective_provider(cfg)
+    mode, rday, anchor = renewal_settings(cfg, prov)
+    cycles = {}
+    for k, nets in ledger.get("days", {}).items():
+        s, r = cycle_for(dt.date.fromisoformat(k), mode, rday, anchor)
+        tot = sum(a + b for n, (a, b) in nets.items() if counted(cfg, n))
+        c = cycles.setdefault(s.isoformat(), {"start": s.isoformat(), "renews": r.isoformat(), "bytes": 0})
+        c["bytes"] += tot
+    out = sorted(cycles.values(), key=lambda c: c["start"], reverse=True)
+    for c in out:
+        c["label"] = fmt_bytes(c["bytes"], int(cfg.get("unit_base") or 1000))
+    return out
+
+
+def doctor(cfg):
+    ok = True
+    def line(good, msg):
+        nonlocal ok
+        ok &= good
+        print(("  ✓ " if good else "  ✗ ") + msg)
+    line(sys.version_info >= (3, 8), f"python {sys.version.split()[0]}")
+    for tool in ("ip", "iw", "curl"):
+        line(bool(shutil.which(tool)), f"{tool} available")
+    line(bool(shutil.which("gum")), "gum available (for `eiu setup`)")
+    line(bool(interfaces()), "network interfaces readable: " + ", ".join(interfaces()))
+    led = read_json(LEDGER_FILE, None)
+    line(led is not None, f"ledger at {LEDGER_FILE}" + (f" (updated {led.get('updated')})" if led else " (run `eiu collect`)"))
+    line(bool(cfg.get("setup_done")), "setup done" if cfg.get("setup_done") else "setup not done (run `eiu setup` or open the bar widget)")
+    g = geo()
+    line(True, f"location: {g.get('country') or (g.get('last_ok') or {}).get('country') or 'unknown'} via {g.get('source', 'cache')}")
+    allowed, why = egypt_gate(cfg, g, (led or {}).get("networks_now") or [])
+    line(allowed, f"Egypt gate: {why}")
+    plug = os.path.join(HOME, ".config/omarchy/plugins/eiu")
+    line(os.path.exists(plug), f"Omarchy plugin at {plug}")
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------- main
+
+def main(argv):
+    ensure_dirs()
+    cfg = load_config()
+    cmd = argv[0] if argv else "status"
+    args = argv[1:]
+    as_json = "--json" in args or "-j" in args
+
+    try:
+        if cmd in ("-h", "--help", "help"):
+            print(__doc__.strip())
+        elif cmd in ("-v", "--version", "version"):
+            print(f"eiu {VERSION}")
+        elif cmd == "collect":
+            st = refresh_status(cfg, collect_first=True)
+            if "--status" in args:
+                print(json.dumps(st))
+        elif cmd == "status":
+            st = refresh_status(cfg, collect_first=False, quick="--full" not in args)
+            print(json.dumps(st, indent=1) if as_json else "", end="")
+            if not as_json:
+                print_status(st)
+        elif cmd == "detect":
+            d = detect_provider(geo(force="--refresh" in args))
+            if as_json:
+                print(json.dumps(d, indent=1))
+            else:
+                print(f"{d['name']}  (confidence {d['confidence']}%)")
+                for e in d["evidence"]:
+                    print("  •", e)
+                print()
+                for k, v in d["signals"].items():
+                    print(f"  {k:12} {v}")
+        elif cmd == "setup":
+            setup(cfg)
+        elif cmd == "set":
+            if len(args) < 1 or args[0] in ("-h", "--help"):
+                for k, v in SETTABLE.items():
+                    print(f"  {k:15} {v}")
+                return 0
+            set_key(cfg, args[0], args[1] if len(args) > 1 else "")
+            st = refresh_status(load_config(), collect_first=False)
+            if as_json or "--status" in args:
+                print(json.dumps(st))
+        elif cmd == "configure":
+            # One-shot from the bar widget: eiu configure '<json>'
+            patch = json.loads(args[0])
+            for k, v in patch.items():
+                set_key(cfg, k, str(v))
+                cfg = load_config()
+            cfg["setup_done"] = True
+            save_config(cfg)
+            print(json.dumps(refresh_status(cfg, collect_first=True)))
+        elif cmd == "adjust":
+            st = build_status(cfg)
+            if args and args[0] == "--clear":
+                cfg["adjust"] = None
+            else:
+                target = parse_amount(args[0], int(cfg.get("unit_base") or 1000))
+                cfg["adjust"] = {"cycle_start": st["cycle"]["start"], "bytes": target - st["measured"]}
+            save_config(cfg)
+            print_status(refresh_status(cfg))
+        elif cmd == "history":
+            h = history(cfg)
+            if as_json:
+                print(json.dumps(h, indent=1))
+            else:
+                for c in h:
+                    print(f"  {c['start']} → {c['renews']}   {c['label']}")
+        elif cmd == "debug":
+            if args:
+                cfg["debug"] = args[0] in ("on", "true", "1")
+                save_config(cfg)
+            print("debug mode", "on" if cfg.get("debug") else "off")
+            refresh_status(cfg)
+        elif cmd == "providers":
+            if as_json:
+                print(json.dumps({"providers": PROVIDERS, "plans": PLANS_GB}, indent=1))
+            else:
+                for k, v in PROVIDERS.items():
+                    print(f"  {k:9} {v['name']:32} {v['renewal_note']}")
+                print("  plans:", ", ".join(plan_label(g) for g in PLANS_GB), "or custom")
+        elif cmd == "doctor":
+            return doctor(cfg)
+        elif cmd == "reset":
+            if "--yes" not in args:
+                print("This deletes all collected usage. Run `eiu reset --yes` to confirm.")
+                return 1
+            for f in (LEDGER_FILE, STATUS_FILE, os.path.join(STATE_DIR, "alerts.json")):
+                if os.path.exists(f):
+                    os.remove(f)
+            print("usage data cleared")
+        else:
+            print(f"unknown command '{cmd}'\n", file=sys.stderr)
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+    except ValueError as e:
+        print(f"eiu: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
